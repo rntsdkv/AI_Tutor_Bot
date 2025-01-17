@@ -27,6 +27,7 @@ import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import requests
 import uuid
+import datetime
 
 config = configparser.ConfigParser()
 config.read("config.ini")
@@ -134,9 +135,9 @@ async def name_enter(message: Message, state: FSMContext):
     last_name, first_name = message.text.split()
     async with aiosqlite.connect('bot.db') as db:
         async with db.execute("SELECT id FROM users WHERE id = ?", (message.from_user.id,)) as cursor:
-            await cursor.execute('INSERT INTO users (id, last_name, first_name, current_language, statusrem) VALUES ('
-                                 '?, ?, ?, ?, ?)',
-                                 (message.from_user.id, last_name, first_name, "", False))
+            await cursor.execute('INSERT INTO users (id, last_name, first_name, current_language, reminder) VALUES ('
+                                 '?, ?, ?, ?, null)',
+                                 (message.from_user.id, last_name, first_name, ""))
             await db.commit()
     await state.clear()
 
@@ -246,9 +247,20 @@ async def choose_language(message: Message, state: FSMContext):
         await message.answer(text="Выбирете что-то на клавиатуре.")
 
 
-@dp.message(Command("set_time"))
+@dp.message(Command("on"))
 async def cmd_set_time(message: Message):
-    await message.answer("Скоро здесь будет функционал")
+    async with aiosqlite.connect('bot.db') as db:
+        await db.execute('UPDATE users SET (reminder) = (?) WHERE id = (?)',
+                         (13, message.from_user.id))
+        await db.commit()
+
+
+@dp.message(Command("off"))
+async def cmd_set_time(message: Message):
+    async with aiosqlite.connect('bot.db') as db:
+        await db.execute('UPDATE users SET reminder = null WHERE id = (?)',
+                         (message.from_user.id, ))
+        await db.commit()
 
 
 @dp.message(State(None))
@@ -273,7 +285,7 @@ async def start_db():
                 first_name TEXT,
                 current_language TEXT,
                 current_level TEXT,
-                statusrem BOOLEAN
+                reminder INTEGER
             )
         ''')
         await db.commit()
@@ -298,7 +310,28 @@ async def start_db():
         await db.commit()
 
 
+async def send_msg(dp):
+    hours = datetime.datetime.now().hour
+
+    async with aiosqlite.connect('bot.db') as db:
+        if hours == 0:
+            async with db.execute("SELECT * FROM users WHERE reminder IS NOT NULL AND reminder > 24") as cursor:
+                async for row in cursor:
+                    await db.execute("UPDATE users SET (reminder) = (?) WHERE id = (?)", (row[5] // 100, row[0]))
+
+        async with db.execute("SELECT * FROM users WHERE reminder IS NOT NULL AND reminder < 25") as cursor:
+            async for row in cursor:
+                user_time = row[5]
+                if user_time == hours:
+                    await bot.send_message(chat_id=row[0], text='⏰ Пора изучать новые слова')
+                    await db.execute("UPDATE users SET (reminder) = (?) WHERE id = (?)", (user_time * 100, row[0]))
+        await db.commit()
+
+
 async def main():
+    scheduler = AsyncIOScheduler(timezone='Europe/Moscow')
+    job = scheduler.add_job(send_msg, 'interval', seconds=10, args=(dp,))
+    scheduler.start()
     dp.message.outer_middleware(SomeMiddleware())
     dp.startup.register(start_bot)
     dp.startup.register(start_db)
@@ -307,8 +340,9 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        scheduler.remove_job(job.id)
         await bot.session.close()
         print("Бот остановлен")
-# glkrn
+
 
 asyncio.run(main())
