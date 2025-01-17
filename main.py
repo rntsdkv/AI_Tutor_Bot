@@ -90,13 +90,12 @@ class SomeMiddleware(BaseMiddleware):
         current_state = await state.get_state()
 
         async with aiosqlite.connect('bot.db') as db:
-            await db.execute("INSERT INTO messages (user_id, message, state, datetime) VALUES (?, ?, ?, ?)",
-                             (message.from_user.id, message.text, str(current_state), message.date))
-
             if message.text[0] == '/':
                 action = "use_command"
             else:
                 action = "send_message"
+                await db.execute("INSERT INTO messages (user_id, message, state, datetime) VALUES (?, ?, ?, ?)",
+                                 (message.from_user.id, message.text, str(current_state), message.date))
             await db.execute("INSERT INTO logs (user_id, action, text, datetime) VALUES (?, ?, ?, ?)",
                              (message.from_user.id, action, message.text, message.date))
 
@@ -135,9 +134,8 @@ async def name_enter(message: Message, state: FSMContext):
     last_name, first_name = message.text.split()
     async with aiosqlite.connect('bot.db') as db:
         async with db.execute("SELECT id FROM users WHERE id = ?", (message.from_user.id,)) as cursor:
-            await cursor.execute('INSERT INTO users (id, last_name, first_name, current_language, reminder) VALUES ('
-                                 '?, ?, ?, ?, null)',
-                                 (message.from_user.id, last_name, first_name, ""))
+            await cursor.execute('INSERT INTO users (id, last_name, first_name) VALUES (?, ?, ?)',
+                                 (message.from_user.id, last_name, first_name))
             await db.commit()
     await state.clear()
 
@@ -250,6 +248,12 @@ async def choose_language(message: Message, state: FSMContext):
 @dp.message(Command("on"))
 async def cmd_set_time(message: Message):
     async with aiosqlite.connect('bot.db') as db:
+        user_language = await db.execute('SELECT current_language FROM users WHERE id = (?) AND current_language <> ""', (message.from_user.id,))
+        user_language = await user_language.fetchone()
+        if user_language is None:
+            await message.answer(text="Вы сможете настроить уведомления после выбора изучаемого языка\n\n"
+                                      "Подсказка: /choose")
+            return
         await db.execute('UPDATE users SET (reminder) = (?) WHERE id = (?)',
                          (13, message.from_user.id))
         await db.commit()
@@ -259,7 +263,7 @@ async def cmd_set_time(message: Message):
 async def cmd_set_time(message: Message):
     async with aiosqlite.connect('bot.db') as db:
         await db.execute('UPDATE users SET reminder = null WHERE id = (?)',
-                         (message.from_user.id, ))
+                         (message.from_user.id,))
         await db.commit()
 
 
