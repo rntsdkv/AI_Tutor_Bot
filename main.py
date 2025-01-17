@@ -28,30 +28,21 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import requests
 import uuid
 import datetime
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_gigachat.chat_models import GigaChat
 
 config = configparser.ConfigParser()
 config.read("config.ini")
 
 TG_TOKEN = config["Telegram"]["token"]
 GC_TOKEN = config["GigaChat"]["token"]
-rq_uid = str(uuid.uuid4())
 
-url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-
-payload = {
-    'scope': 'GIGACHAT_API_PERS'
-}
-headers = {
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Accept': 'application/json',
-    'RqUID': rq_uid,
-    'Authorization': f'Basic {GC_TOKEN}'
-}
-
-response = requests.request("POST", url, headers=headers, data=payload, verify=False)
-giga_token = response.json()["access_token"]
-
-print(response.text)
+llm = GigaChat(
+    credentials=GC_TOKEN,
+    scope="GIGACHAT_API_PERS",
+    model="GigaChat",
+    verify_ssl_certs=False
+)
 
 LANGUAGES = {"en": "🇬🇧 Английский",
              "fr": "🇫🇷 Французский",
@@ -75,6 +66,15 @@ class Form(StatesGroup):
     name = State()
     choose_language = State()
     choose_level = State()
+    reminder_time_enter = State()
+
+
+class Keyboard:
+    menu_button_1 = InlineKeyboardButton(text="Изучать слова",
+                                        callback_data="study_words")
+    menu_button_2 = InlineKeyboardButton(text="⏰ Настроить напоминания",
+                                        callback_data="set_reminder")
+    menu_keyboard = InlineKeyboardMarkup(inline_keyboard=[[menu_button_1], [menu_button_2]])
 
 
 class SomeMiddleware(BaseMiddleware):
@@ -245,8 +245,33 @@ async def choose_language(message: Message, state: FSMContext):
         await message.answer(text="Выбирете что-то на клавиатуре.")
 
 
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    await message.answer(text="Меню",
+                         reply_markup=Keyboard.menu_keyboard)
+
+
+@dp.callback_query(F.data == "study_words")
+async def callback_study_words(callback: CallbackQuery):
+    async with aiosqlite.connect('bot.db') as db:
+        async with db.execute("SELECT * FROM users WHERE id = (?)", (callback.from_user.id,)) as cursor:
+            async for row in cursor:
+                user_lang, user_lvl = LANGUAGES[row[3]], LEVELS[row[4]]
+                print(user_lvl, user_lang)
+                messages = [SystemMessage(
+                    content=f"Ты бот-репетитор по {user_lang}, с тобой занимается пользователь уровня {user_lvl}, ты "
+                            f"помогаешь пользователю изучать язык."
+                ), HumanMessage(content="предложи несколько слов, подходящих для изучения")]
+                res = llm.invoke(messages)
+                messages.append(res)
+                print("GigaChat: ", res.content)
+                await bot.send_message(chat_id=callback.from_user.id,
+                                       text=res.content)
+                await callback.answer()
+
+
 @dp.message(Command("on"))
-async def cmd_set_time(message: Message):
+async def cmd_on(message: Message, state: FSMContext):
     async with aiosqlite.connect('bot.db') as db:
         user_language = await db.execute('SELECT current_language FROM users WHERE id = (?) AND current_language <> ""', (message.from_user.id,))
         user_language = await user_language.fetchone()
@@ -254,17 +279,70 @@ async def cmd_set_time(message: Message):
             await message.answer(text="Вы сможете настроить уведомления после выбора изучаемого языка\n\n"
                                       "Подсказка: /choose")
             return
+        await message.answer("Для установления времени напоминания введите час, в который я буду тебе писать.\n\n"
+                             "Например: 13\n"
+                             "Тогда я буду отправлять напоминание в 13.00 по МСК\n"
+                             "Для отмены напиши слово Отмена")
+        await state.set_state(Form.reminder_time_enter)
+
+
+@dp.callback_query(F.data == "set_reminder")
+async def callback_set_reminder(callback: CallbackQuery, state: FSMContext):
+    async with aiosqlite.connect('bot.db') as db:
+        user_language = await db.execute('SELECT current_language FROM users WHERE id = (?) AND current_language <> ""', (callback.from_user.id,))
+        user_language = await user_language.fetchone()
+        if user_language is None:
+            await bot.send_message(chat_id=callback.from_user.id,
+                                   text="Вы сможете настроить уведомления после выбора изучаемого языка\n\n"
+                                        "Подсказка: /choose")
+            await callback.answer()
+            return
+        await bot.send_message(chat_id=callback.from_user.id,
+                               text="Для установления времени напоминания введите час, в который я буду тебе "
+                                    "писать.\n\n"
+                                    "Например: 13\n"
+                                    "Тогда я буду отправлять напоминание в 13.00 по МСК\n"
+                                    "Для отмены напиши слово Отмена")
+        await callback.answer()
+        await state.set_state(Form.reminder_time_enter)
+
+
+@dp.message(Form.reminder_time_enter)
+async def time_enter(message: Message, state: FSMContext):
+    if message.text == "Отмена":
+        await state.clear()
+        await message.answer("Хорошо, вернул в меню.")
+        return
+
+    try:
+        number = int(message.text)
+    except:
+        number = 100
+
+    if number < 0 or number > 23:
+        await message.answer("Введено неправильное значение, попробуйте снова.")
+        return
+
+    async with aiosqlite.connect('bot.db') as db:
         await db.execute('UPDATE users SET (reminder) = (?) WHERE id = (?)',
-                         (13, message.from_user.id))
+                         (number, message.from_user.id))
         await db.commit()
+
+    await message.answer(f"⏰ Хорошо! Буду уведомлять вас в {number} часов каждый день.\n\n"
+                         f"Для выключения напоминаний используйте команду /off")
+    await bot.send_message(chat_id=message.from_user.id,
+                           text="Меню",
+                           reply_markup=Keyboard.menu_keyboard)
+    await state.clear()
 
 
 @dp.message(Command("off"))
-async def cmd_set_time(message: Message):
+async def cmd_off(message: Message):
     async with aiosqlite.connect('bot.db') as db:
         await db.execute('UPDATE users SET reminder = null WHERE id = (?)',
                          (message.from_user.id,))
         await db.commit()
+    await message.answer("Вы отключили напоминания.")
 
 
 @dp.message(State(None))
@@ -274,9 +352,11 @@ async def prtext(message: Message):
 
 
 async def start_bot():
-    commands = [BotCommand(command='help', description='Подсказка со всеми командами'),
+    commands = [BotCommand(command='menu', description='Открыть меню'),
                 BotCommand(command='choose', description='Выбор или смена изучаемого языка'),
-                BotCommand(command='set_time', description='Выбрать время напоминания для изучения')]
+                BotCommand(command='on', description='Выбрать время напоминания для изучения'),
+                BotCommand(command='off', description='Отключить напоминание'),
+                BotCommand(command='help', description='Подсказка со всеми командами')]
     await bot.set_my_commands(commands, BotCommandScopeDefault())
 
 
