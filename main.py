@@ -309,6 +309,6 @@ async def main():
     finally:
         await bot.session.close()
         print("Бот остановлен")
-
+# glkrn
 
 asyncio.run(main())
