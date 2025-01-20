@@ -30,6 +30,7 @@ import uuid
 import datetime
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_gigachat.chat_models import GigaChat
+from random import randint
 
 config = configparser.ConfigParser()
 config.read("config.ini")
@@ -67,14 +68,17 @@ class Form(StatesGroup):
     choose_language = State()
     choose_level = State()
     reminder_time_enter = State()
+    study_translate = State()
 
 
 class Keyboard:
-    menu_button_1 = InlineKeyboardButton(text="Изучать слова",
-                                        callback_data="study_words")
-    menu_button_2 = InlineKeyboardButton(text="⏰ Настроить напоминания",
-                                        callback_data="set_reminder")
-    menu_keyboard = InlineKeyboardMarkup(inline_keyboard=[[menu_button_1], [menu_button_2]])
+    menu_button_1 = InlineKeyboardButton(text="🔤 Изучать слова",
+                                         callback_data="study_words")
+    menu_button_2 = InlineKeyboardButton(text="ℹ️ Изучать темы",
+                                         callback_data="study_topics")
+    menu_button_3 = InlineKeyboardButton(text="⏰ Настроить напоминания",
+                                         callback_data="set_reminder")
+    menu_keyboard = InlineKeyboardMarkup(inline_keyboard=[[menu_button_1, menu_button_2], [menu_button_3]])
 
 
 class SomeMiddleware(BaseMiddleware):
@@ -252,28 +256,96 @@ async def cmd_menu(message: Message):
 
 
 @dp.callback_query(F.data == "study_words")
-async def callback_study_words(callback: CallbackQuery):
+async def callback_study_words(callback: CallbackQuery, state: FSMContext):
     async with aiosqlite.connect('bot.db') as db:
+        async with db.execute("SELECT * FROM words WHERE user_id = (?) and repeat > 0",
+                              (callback.from_user.id,)) as cursor:
+            results = await cursor.fetchall()
+            print(results)
+            if len(results) > 0 and randint(1, 10) % 2 == 0:
+                foreign_word = results[randint(0, len(results) - 1)][1]
+                print(foreign_word)
+                await state.update_data(word=foreign_word)
+                await state.set_state(Form.study_translate)
+                exit_button = InlineKeyboardButton(text="Отмена",
+                                                   callback_data="exit")
+                await bot.send_message(chat_id=callback.from_user.id,
+                                       text=f"Давайте повторим слово {foreign_word}\n"
+                                            f"Вам необходимо написать его перевод",
+                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[[exit_button]]))
+                await callback.answer()
+                return
+
         async with db.execute("SELECT * FROM users WHERE id = (?)", (callback.from_user.id,)) as cursor:
             async for row in cursor:
                 user_lang, user_lvl = LANGUAGES[row[3]], LEVELS[row[4]]
-                print(user_lvl, user_lang)
-                messages = [SystemMessage(
-                    content=f"Ты бот-репетитор по {user_lang}, с тобой занимается пользователь уровня {user_lvl}, ты "
-                            f"помогаешь пользователю изучать язык."
-                ), HumanMessage(content="предложи несколько слов, подходящих для изучения")]
-                res = llm.invoke(messages)
-                messages.append(res)
-                print("GigaChat: ", res.content)
+
+                norm = True
+                while norm:
+                    try:
+                        messages = [SystemMessage(
+                            content=f"Ты бот-репетитор по {user_lang}, с тобой занимается пользователь уровня "
+                                    f"{user_lvl}, ты помогаешь пользователю изучать язык."
+                        ), HumanMessage(content='Предложи новое слово. Формат ответа: "(слово, перевод этого слова)". '
+                                                'Не пиши ничего лишнего.')]
+                        res = llm.invoke(messages)
+                        foreign_word, russian_word = res.content.replace('(', '').replace(')', '').split(', ')
+                        messages.append(res)
+                        norm = False
+                    except:
+                        print("Ошибка: глупая нейронка")
+
                 await bot.send_message(chat_id=callback.from_user.id,
-                                       text=res.content)
+                                       text=f'Новое слово для изучения – {foreign_word}\n'
+                                            f'Оно означает "{russian_word}"')
+                await db.execute("INSERT INTO words (user_id, word, translation, repeat) VALUES (?, ?, ?, ?)",
+                                 (callback.from_user.id, foreign_word, russian_word, 2))
+                await db.commit()
                 await callback.answer()
+
+
+@dp.message(Form.study_translate)
+async def study_translate(message: Message, state: FSMContext):
+    foreign_word = await state.get_data()
+    foreign_word = foreign_word['word']
+    messages = [HumanMessage(content=f"Тебе нужно проверить: совпадает ли {foreign_word} с переводом {message.text}. "
+                                     f"Напиши только Да или Нет.")]
+    res = llm.invoke(messages)
+    if res.content.lower() == "да":
+        await message.answer("Правильно!")
+        async with aiosqlite.connect('bot.db') as db:
+            async with db.execute("SELECT * FROM words WHERE user_id = (?) and word = (?)",
+                                  (message.from_user.id, foreign_word)) as cursor:
+                async for row in cursor:
+                    repeat = row[3]
+                    await db.execute("UPDATE words SET repeat = (?) WHERE user_id = (?) and word = (?)",
+                                     (repeat - 1, message.from_user.id, foreign_word))
+                    await db.commit()
+    else:
+        await message.answer("Неправильно, повтори попытку")
+
+    await state.clear()
+
+
+@dp.callback_query(F.data == "exit")
+async def exit_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await bot.send_message(chat_id=callback.from_user.id,
+                           text="Меню",
+                           reply_markup=Keyboard.menu_keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "study_topics")
+async def study_topics(callback: CallbackQuery):
+    pass
 
 
 @dp.message(Command("on"))
 async def cmd_on(message: Message, state: FSMContext):
     async with aiosqlite.connect('bot.db') as db:
-        user_language = await db.execute('SELECT current_language FROM users WHERE id = (?) AND current_language <> ""', (message.from_user.id,))
+        user_language = await db.execute('SELECT current_language FROM users WHERE id = (?) AND current_language <> ""',
+                                         (message.from_user.id,))
         user_language = await user_language.fetchone()
         if user_language is None:
             await message.answer(text="Вы сможете настроить уведомления после выбора изучаемого языка\n\n"
@@ -289,7 +361,8 @@ async def cmd_on(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "set_reminder")
 async def callback_set_reminder(callback: CallbackQuery, state: FSMContext):
     async with aiosqlite.connect('bot.db') as db:
-        user_language = await db.execute('SELECT current_language FROM users WHERE id = (?) AND current_language <> ""', (callback.from_user.id,))
+        user_language = await db.execute('SELECT current_language FROM users WHERE id = (?) AND current_language <> ""',
+                                         (callback.from_user.id,))
         user_language = await user_language.fetchone()
         if user_language is None:
             await bot.send_message(chat_id=callback.from_user.id,
@@ -389,6 +462,15 @@ async def start_db():
                 action TEXT,
                 text TEXT,
                 datetime TEXT
+            )
+        ''')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS words (
+                user_id INTEGER,
+                word TEXT,
+                translation TEXT,
+                repeat INTEGER
             )
         ''')
         await db.commit()
