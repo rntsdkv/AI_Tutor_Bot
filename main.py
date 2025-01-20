@@ -98,17 +98,13 @@ class SomeMiddleware(BaseMiddleware):
                 action = "use_command"
             else:
                 action = "send_message"
-                await db.execute("INSERT INTO messages (user_id, message, state, datetime) VALUES (?, ?, ?, ?)",
-                                 (message.from_user.id, message.text, str(current_state), message.date))
             await db.execute("INSERT INTO logs (user_id, action, text, datetime) VALUES (?, ?, ?, ?)",
                              (message.from_user.id, action, message.text, message.date))
-
             await db.commit()
 
         async with aiosqlite.connect('bot.db') as db:
             cursor = await db.execute("SELECT * FROM users")
             rows = await cursor.fetchall()
-            print('rows %s' % rows)
 
         if message.text != '/start' and current_state != Form.name:
             async with aiosqlite.connect('bot.db') as db:
@@ -171,7 +167,6 @@ async def cmd_help(message: Message):
     async with aiosqlite.connect('bot.db') as db:
         cursor = await db.execute("SELECT * FROM logs")
         rows = await cursor.fetchall()
-        print('rows %s' % rows)
     await message.answer("Вот список доступных команд:\n"
                          "/help – Показать описание команд\n"
                          "/choose – Выбор или смена изучаемого языка\n"
@@ -266,10 +261,8 @@ async def callback_study_words(callback: CallbackQuery, state: FSMContext):
         async with db.execute("SELECT * FROM words WHERE user_id = (?) and repeat > 0",
                               (callback.from_user.id,)) as cursor:
             results = await cursor.fetchall()
-            print(results)
             if len(results) > 0 and randint(1, 10) % 2 == 0:
                 foreign_word = results[randint(0, len(results) - 1)][1]
-                print(foreign_word)
                 await state.update_data(word=foreign_word)
                 await state.set_state(Form.study_translate)
                 exit_button = InlineKeyboardButton(text="Отмена",
@@ -326,10 +319,9 @@ async def study_translate(message: Message, state: FSMContext):
                     await db.execute("UPDATE words SET repeat = (?) WHERE user_id = (?) and word = (?)",
                                      (repeat - 1, message.from_user.id, foreign_word))
                     await db.commit()
+                    await state.clear()
     else:
         await message.answer("Неправильно, повтори попытку")
-
-    await state.clear()
 
 
 @dp.callback_query(F.data == "exit")
