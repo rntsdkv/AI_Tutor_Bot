@@ -124,9 +124,17 @@ class SomeMiddleware(BaseMiddleware):
 
 @dp.message(CommandStart(), State(None))
 async def cmd_start(message: Message, state: FSMContext):
-    await message.answer(f"Привет, {message.from_user.first_name}!\nДля начала работы введите Ваши фамилию и имя:")
-    await state.update_data(lastfirstname=f"{message.from_user.last_name} {message.from_user.first_name}")
-    await state.set_state(Form.name)
+    async with aiosqlite.connect('bot.db') as db:
+        async with db.execute("SELECT id FROM users WHERE id = ?", (message.from_user.id,)) as cursor:
+            if await cursor.fetchone() is None:
+                await message.answer(f"Привет, {message.from_user.first_name}!\nДля начала работы введите Ваши "
+                                     f"фамилию и имя:")
+                await state.update_data(lastfirstname=f"{message.from_user.last_name} {message.from_user.first_name}")
+                await state.set_state(Form.name)
+                return
+        await bot.send_message(chat_id=message.from_user.id,
+                               text="Меню",
+                               reply_markup=Keyboard.menu_keyboard)
 
 
 @dp.message(Form.name)
@@ -213,40 +221,37 @@ async def choose_language(message: Message, state: FSMContext):
             async with aiosqlite.connect('bot.db') as db:
                 await db.execute('UPDATE users SET (current_language) = (?) WHERE id = (?)',
                                  (code, message.from_user.id))
+                await db.execute('DELETE FROM words WHERE user_id = (?)',
+                                 (message.from_user.id,))
                 await db.commit()
 
-            button_0 = KeyboardButton(text="Пройти тест")
             button_1 = KeyboardButton(text="Новичок A0")
             button_2 = KeyboardButton(text="Начальный A1-A2")
             button_3 = KeyboardButton(text="Продвинутый B1-B2")
             button_4 = KeyboardButton(text="Профессиональный C1")
-            keyboard = ReplyKeyboardMarkup(keyboard=[[button_0], [button_1, button_2], [button_3, button_4]],
+            keyboard = ReplyKeyboardMarkup(keyboard=[[button_1, button_2], [button_3, button_4]],
                                            resize_keyboard=True)
             await message.answer(text=f"Вы выбрали {message.text} язык.\n\nТеперь необходимо выбрать "
-                                      f"уровень языка или пройти тест на определение уровня. Выберете уровень "
-                                      f"на клавиатуре или пройдите тест на уровень языка.",
+                                      f"уровень языка на клавиатуре.",
                                  reply_markup=keyboard)
             await state.set_state(Form.choose_level)
 
 
 @dp.message(Form.choose_level)
 async def choose_language(message: Message, state: FSMContext):
-    if message.text == "Пройти тест":
-        pass
-    else:
-        for code, level in LEVELS.items():
-            if level == message.text:
-                async with aiosqlite.connect('bot.db') as db:
-                    await db.execute('UPDATE users SET (current_level) = (?) WHERE id = (?)',
-                                     (code, message.from_user.id))
-                    await db.commit()
-                    await message.answer(
-                        text="Хорошо, записал ваш уровень. Буду рекомендовать темы и слова именно по вашему "
-                             "уровню!",
-                        reply_markup=ReplyKeyboardRemove())
-                    await state.clear()
-                    return
-        await message.answer(text="Выбирете что-то на клавиатуре.")
+    for code, level in LEVELS.items():
+        if level == message.text:
+            async with aiosqlite.connect('bot.db') as db:
+                await db.execute('UPDATE users SET (current_level) = (?) WHERE id = (?)',
+                                 (code, message.from_user.id))
+                await db.commit()
+                await message.answer(
+                    text="Хорошо, записал ваш уровень. Буду рекомендовать темы и слова именно по вашему "
+                         "уровню!",
+                    reply_markup=ReplyKeyboardRemove())
+                await state.clear()
+                return
+    await message.answer(text="Выбирете что-то на клавиатуре.")
 
 
 @dp.message(Command("menu"))
@@ -338,7 +343,17 @@ async def exit_callback(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "study_topics")
 async def study_topics(callback: CallbackQuery):
-    pass
+    async with aiosqlite.connect('bot.db') as db:
+        async with db.execute("SELECT * FROM users WHERE id = (?)", (callback.from_user.id,)) as cursor:
+            async for row in cursor:
+                user_lang, user_lvl = LANGUAGES[row[3]], LEVELS[row[4]]
+                messages = [SystemMessage(content=f"Ты бот-репетитор по {user_lang}, с тобой занимается пользователь "
+                                                  f"уровня {user_lvl}, ты помогаешь пользователю изучать язык."),
+                            HumanMessage(content=f"Нужно доступно объяснить любую тему по грамматике")]
+                res = llm.invoke(messages)
+                await bot.send_message(chat_id=callback.from_user.id,
+                                       text=res.content)
+                await callback.answer()
 
 
 @dp.message(Command("on"))
@@ -420,8 +435,19 @@ async def cmd_off(message: Message):
 
 @dp.message(State(None))
 async def prtext(message: Message):
-    await message.answer("Не очень понимаю, о чем вы говорите. Воспользуйтесь командой /help или меню команд, "
-                         "чтобы работать с ботом.")
+    async with aiosqlite.connect('bot.db') as db:
+        async with db.execute("SELECT * FROM users WHERE id = (?)", (message.from_user.id,)) as cursor:
+            async for row in cursor:
+                user_lang, user_lvl = LANGUAGES[row[3]], LEVELS[row[4]]
+                messages = [SystemMessage(content=f"Ты бот-репетитор по {user_lang}, с тобой занимается пользователь "
+                                                  f"уровня {user_lvl}, ты помогаешь пользователю изучать язык. "
+                                                  f"Если вопрос не связан с изучением языка, скажи, что ты не можешь "
+                                                  f"ничего сказать по этой теме – это важно. Тебе нельзя разговаривать "
+                                                  f"на другие темы."),
+                            HumanMessage(content=message.text)]
+                res = llm.invoke(messages)
+                await bot.send_message(chat_id=message.from_user.id,
+                                       text=res.content)
 
 
 async def start_bot():
@@ -446,15 +472,6 @@ async def start_db():
             )
         ''')
         await db.commit()
-
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                user_id INTEGER,
-                message TEXT,
-                state TEXT,
-                datetime TEXT
-            )
-        ''')
 
         await db.execute('''
             CREATE TABLE IF NOT EXISTS logs (
